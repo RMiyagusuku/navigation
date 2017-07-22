@@ -67,6 +67,11 @@
 #include <boost/foreach.hpp>
 
 #define NEW_UNIFORM_SAMPLING 1
+#define DEBUG true
+
+geometry_msgs::PoseArray posearray;
+int posearray_size;
+static int m;
 
 using namespace amcl;
 
@@ -140,6 +145,8 @@ class AmclNode
     // Pose-generating function used to uniformly distribute particles over
     // the map
     static pf_vector_t uniformPoseGenerator(void* arg);
+    static pf_vector_t setPose(void* arg);
+    
 #if NEW_UNIFORM_SAMPLING
     static std::vector<std::pair<int,int> > free_space_indices;
 #endif
@@ -153,6 +160,7 @@ class AmclNode
 
     void laserReceived(const sensor_msgs::LaserScanConstPtr& laser_scan);
     void initialPoseReceived(const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg);
+    void setPoseArrayReceived(const geometry_msgs::PoseArray& msg);
     void handleInitialPoseMessage(const geometry_msgs::PoseWithCovarianceStamped& msg);
     void mapReceived(const nav_msgs::OccupancyGridConstPtr& msg);
 
@@ -194,6 +202,8 @@ class AmclNode
     std::vector< AMCLLaser* > lasers_;
     std::vector< bool > lasers_update_;
     std::map< std::string, int > frame_to_laser_;
+    
+    ros::Subscriber initial_pose_array_sub_;
 
     // Particle filter
     pf_t *pf_;
@@ -234,6 +244,7 @@ class AmclNode
     ros::Publisher pose_pub_;
     ros::Publisher particlecloud_pub_;
     ros::ServiceServer global_loc_srv_;
+    ros::ServiceServer random_init_srv_;
     ros::ServiceServer nomotion_update_srv_; //to let amcl update samples without requiring motion
     ros::ServiceServer set_map_srv_;
     ros::Subscriber initial_pose_sub_old_;
@@ -285,7 +296,7 @@ void sigintHandler(int sig)
 int
 main(int argc, char** argv)
 {
-  ros::init(argc, argv, "amcl");
+  ros::init(argc, argv, "wifi_amcl");
   ros::NodeHandle nh;
 
   // Override default sigint handler
@@ -421,6 +432,7 @@ AmclNode::AmclNode() :
 
   pose_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 2, true);
   particlecloud_pub_ = nh_.advertise<geometry_msgs::PoseArray>("particlecloud", 2, true);
+  
   global_loc_srv_ = nh_.advertiseService("global_localization", 
 					 &AmclNode::globalLocalizationCallback,
                                          this);
@@ -436,6 +448,8 @@ AmclNode::AmclNode() :
   laser_scan_filter_->registerCallback(boost::bind(&AmclNode::laserReceived,
                                                    this, _1));
   initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
+  
+  initial_pose_array_sub_ = nh_.subscribe("amcl_setposearray", 2, &AmclNode::setPoseArrayReceived, this);
 
   if(use_map_topic_) {
     map_sub_ = nh_.subscribe("map", 1, &AmclNode::mapReceived, this);
@@ -453,6 +467,48 @@ AmclNode::AmclNode() :
   laser_check_interval_ = ros::Duration(15.0);
   check_laser_timer_ = nh_.createTimer(laser_check_interval_, 
                                        boost::bind(&AmclNode::checkLaserReceived, this, _1));
+}
+
+void
+AmclNode::setPoseArrayReceived(const geometry_msgs::PoseArray& msg)
+{
+    posearray = msg;    //store the pose array (msg) into a global variable
+    posearray_size = msg.poses.size();
+
+    if (DEBUG)    ROS_INFO("|| size = %d ||", posearray_size);
+    
+    m = 0;
+    boost::recursive_mutex::scoped_lock gl(configuration_mutex_);
+    ROS_INFO("Initializing particle filter with PoseArray.");
+    pf_init_model(pf_, (pf_init_model_fn_t)AmclNode::setPose,
+                (void *)map_);
+    ROS_INFO("Initialisation done");
+    pf_init_ = false;
+}
+
+
+pf_vector_t
+AmclNode::setPose(void* arg)
+{
+  map_t* map = (map_t*)arg;
+  
+  pf_vector_t p;
+  double roll, pitch, yaw;
+
+  tf::Quaternion q;
+  
+  if (m < posearray_size) {
+    p.v[0] = posearray.poses[m].position.x;
+    p.v[1] = posearray.poses[m].position.y;
+    
+    tf::quaternionMsgToTF(posearray.poses[m].orientation, q);
+    tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+    
+    p.v[2] = yaw;
+    m++;
+  }
+      
+  return p;
 }
 
 void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
@@ -598,7 +654,6 @@ void AmclNode::reconfigureCB(AMCLConfig &config, uint32_t level)
 
   initial_pose_sub_ = nh_.subscribe("initialpose", 2, &AmclNode::initialPoseReceived, this);
 }
-
 
 void AmclNode::runFromBag(const std::string &in_bag_fn)
 {
